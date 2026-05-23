@@ -2,6 +2,9 @@
 FeliCa カードリーダーを使った学生入退室管理システムです。<br>
 カードをかざすと入退室を記録し、Slack への通知・週次集計送信を行います。<br>
 プログラムの説明は[こちら](./program/)から
+| プログラム名 | Download |
+|---|---|
+| `card_reader.py` | [Download](./program/dist/updater/updater.exe) |
 
 ## 必要なもの
 - Windows PC
