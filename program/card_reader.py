@@ -41,8 +41,8 @@ class Config:
         self.weekly_marker_file: str = os.environ.get("WEEKLY_LAST_RUN_FILE", "weekly_last_run.txt")
 
         # サウンド設定
-        self.entry_sound_path: str = os.environ.get("ENTRY_SOUND", "猫の鳴き声1.wav")
-        self.exit_sound_path: str = os.environ.get("EXIT_SOUND", "ずんだ_お疲れ様.wav")
+        self.entry_sound_path: str = os.environ.get("ENTRY_SOUND", "")  # 音声ファイル(.wav)があれば記載
+        self.exit_sound_path: str = os.environ.get("EXIT_SOUND", "")    # 音声ファイル(.wav)があれば記載
 
         # FeliCa
         self.service_code: int = int(os.environ.get("FELICA_SERVICE_CODE", "0x200B"), 16)
