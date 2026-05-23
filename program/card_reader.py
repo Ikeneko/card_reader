@@ -41,8 +41,8 @@ class Config:
         self.weekly_marker_file: str = os.environ.get("WEEKLY_LAST_RUN_FILE", "weekly_last_run.txt")
 
         # サウンド設定
-        self.entry_sound_path: str = os.environ.get("ENTRY_SOUND", "")  # サウンドファイル名(.wav)があれば記載
-        self.exit_sound_path: str = os.environ.get("EXIT_SOUND", "")    # サウンドファイル名(.wav)があれば記載
+        self.entry_sound_path: str = os.environ.get("ENTRY_SOUND", "猫の鳴き声1.wav")
+        self.exit_sound_path: str = os.environ.get("EXIT_SOUND", "ずんだ_お疲れ様.wav")
 
         # FeliCa
         self.service_code: int = int(os.environ.get("FELICA_SERVICE_CODE", "0x200B"), 16)
@@ -320,6 +320,12 @@ class GUIApp:
 
     def status_out_threadsafe(self, hours: float):
         self.call_in_ui(self.status_out, hours)
+
+    def show_reader_error(self):
+        self.lbl_status.config(text="⚠ リーダー接続エラー\n再接続を試みています…", fg="red")
+
+    def show_reader_error_threadsafe(self):
+        self.call_in_ui(self.show_reader_error)
 
     def prompt_registration(self, student_id: str) -> dict | None:
         if not messagebox.askyesno(
@@ -642,106 +648,128 @@ class CardWatcher(threading.Thread):
         last_student_id: str | None = None
         last_processed_at: float = 0.0
 
-        try:
-            service_code = self.cfg.service_code
+        service_code = self.cfg.service_code
 
-            def connected(tag):
-                if isinstance(tag, nfc.tag.tt3.Type3Tag):
+        # --- リトライループ ---
+        # USB切断・ハードウェアエラーが発生してもスレッドが死なずに自動復旧する。
+        while not self.stop.is_set():
+            clf: nfc.ContactlessFrontend | None = None
+            try:
+                clf = nfc.ContactlessFrontend('usb')
+                self.gui.log_threadsafe("NFC リーダー接続完了")
+
+                # --- カード読み取りループ ---
+                while not self.stop.is_set():
+                    detected: dict[str, str | None] = {"student_id": None}
+
+                    def connected(tag, _detected=detected):
+                        # クロージャの意図を明示するためデフォルト引数で detected を束縛する
+                        if isinstance(tag, nfc.tag.tt3.Type3Tag):
+                            try:
+                                svcd = nfc.tag.tt3.ServiceCode(service_code >> 6, service_code & 0x3f)
+                                blcd = nfc.tag.tt3.BlockCode(0, service=0)
+                                block_data = tag.read_without_encryption([svcd], [blcd])
+                                _detected["student_id"] = str(block_data[1:8].decode("utf-8"))
+                            except Exception as e:
+                                self.gui.log_threadsafe(f"カード読み取りエラー: {e}")
+                        else:
+                            self.gui.log_threadsafe("エラー: FeliCa (Type3Tag) 以外のカードです")
+                        # True を返すとカードが離れるまで on-connect を1回だけ呼ぶ
+                        return True
+
+                    clf.connect(rdwr={"on-connect": connected})
+                    # ↑ ここでカードが検出されるまでブロック。
+                    #   sleep不要 — clf.connect が次のカードまで待ってくれる。
+
+                    student_id = detected["student_id"]
+                    if not student_id:
+                        # Type3Tag以外など読み取り失敗。即座に次のループへ。
+                        continue
+
+                    now_ts = time.monotonic()
+
+                    # --- 重複読み取りガード ---
+                    # 同一カードが duplicate_guard_seconds 以内に来たら無視する。
+                    # 異なるカードは間隔に関わらず即処理する。
+                    if (student_id == last_student_id
+                            and (now_ts - last_processed_at) < self.cfg.duplicate_guard_seconds):
+                        continue
+
+                    last_student_id = student_id
+                    last_processed_at = now_ts
+                    # -------------------------
+
+                    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    with self.store.student_map_lock:
+                        info = self.store.student_map.get(student_id)
+                    if not info:
+                        self.gui.set_user_threadsafe(student_id, "不明")
+                        reg = self.gui.prompt_registration_threadsafe(student_id)
+                        if reg:
+                            with self.store.student_map_lock:
+                                self.store.student_map[student_id] = {
+                                    "student_id": student_id,
+                                    "name": reg["name"],
+                                }
+                            self.store.save_student_map()
+                            self.gui.log_threadsafe(f"新規登録: {student_id} / {reg['name']}")
+                            with self.store.student_map_lock:
+                                info = self.store.student_map[student_id]
+                        else:
+                            self.gui.log_threadsafe("登録をキャンセルしました")
+                            info = {"student_id": student_id, "name": "不明"}
+
+                    name = info.get("name", "不明")
+                    self.gui.set_user_threadsafe(student_id, name)
+
+                    with self.store.log_lock:
+                        sessions = self.store.log_data.setdefault(student_id, [])
+
+                        if not sessions or "exit" in sessions[-1]:
+                            sessions.append({"entry": now_str})
+                            entry = True
+                        else:
+                            sessions[-1]["exit"] = now_str
+                            try:
+                                dt_entry = dt.datetime.strptime(sessions[-1]["entry"], "%Y-%m-%d %H:%M:%S")
+                                dt_exit = dt.datetime.strptime(sessions[-1]["exit"], "%Y-%m-%d %H:%M:%S")
+                                hours = round((dt_exit - dt_entry).total_seconds() / 3600.0, 2)
+                            except Exception:
+                                hours = 0.0
+                            entry = False
+
+                    if entry:
+                        self.gui.status_in_threadsafe()
+                        self.sound.play("entry")
+                        self.gui.log_threadsafe(f"{now_str} ▶ 入室 - {name}")
+                        self.notifier.post(f"{now_str} {name}さんが入室しました :tada:")
+                    else:
+                        self.gui.status_out_threadsafe(hours)
+                        self.sound.play("exit")
+                        self.gui.log_threadsafe(f"{now_str} ◀ 退室 - {name}")
+                        self.notifier.post(f"{now_str} {name}さんが退出しました :wave:")
+
+                    self.store.save_log()
+
+            except Exception as e:
+                # USB切断・ハードウェア障害など予期せぬエラー。
+                # GUIに警告を表示し、5秒後に clf を再初期化してリトライする。
+                self.gui.log_threadsafe(f"[警告] CardWatcher エラー（5秒後に再接続します）: {e}")
+                self.gui.show_reader_error_threadsafe()
+            finally:
+                # clf が開いていれば必ずクローズしてリソースを解放する
+                if clf is not None:
                     try:
-                        svcd = nfc.tag.tt3.ServiceCode(service_code >> 6, service_code & 0x3f)
-                        blcd = nfc.tag.tt3.BlockCode(0, service=0)
-                        block_data = tag.read_without_encryption([svcd], [blcd])
-                        student_id = str(block_data[1:8].decode("utf-8"))
-                        detected["student_id"] = student_id
-                    except Exception as e:
-                        self.gui.log_threadsafe(f"カード読み取りエラー: {e}")
-                else:
-                    self.gui.log_threadsafe("エラー: FeliCa (Type3Tag) 以外のカードです")
-                # True を返すとカードが離れるまで on-connect を1回だけ呼ぶ
-                return True
+                        clf.close()
+                    except Exception:
+                        pass
 
-            clf = nfc.ContactlessFrontend('usb')
+            # stop が立っていれば即終了、そうでなければ 5 秒待って再試行
+            if self.stop.wait(5):
+                break
 
-            while not self.stop.is_set():
-                detected = {"student_id": None}
-
-                clf.connect(rdwr={"on-connect": connected})
-                # ↑ ここでカードが検出されるまでブロック。
-                #   sleep不要 — clf.connect が次のカードまで待ってくれる。
-
-                student_id = detected["student_id"]
-                if not student_id:
-                    # Type3Tag以外など読み取り失敗。即座に次のループへ。
-                    continue
-
-                now_ts = time.monotonic()
-
-                # --- 重複読み取りガード ---
-                # 同一カードが duplicate_guard_seconds 以内に来たら無視する。
-                # 異なるカードは間隔に関わらず即処理する。
-                if (student_id == last_student_id
-                        and (now_ts - last_processed_at) < self.cfg.duplicate_guard_seconds):
-                    continue
-
-                last_student_id = student_id
-                last_processed_at = now_ts
-                # -------------------------
-
-                now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                with self.store.student_map_lock:
-                    info = self.store.student_map.get(student_id)
-                if not info:
-                    self.gui.set_user_threadsafe(student_id, "不明")
-                    reg = self.gui.prompt_registration_threadsafe(student_id)
-                    if reg:
-                        with self.store.student_map_lock:
-                            self.store.student_map[student_id] = {
-                                "student_id": student_id,
-                                "name": reg["name"],
-                            }
-                        self.store.save_student_map()
-                        self.gui.log_threadsafe(f"新規登録: {student_id} / {reg['name']}")
-                        with self.store.student_map_lock:
-                            info = self.store.student_map[student_id]
-                    else:
-                        self.gui.log_threadsafe("登録をキャンセルしました")
-                        info = {"student_id": student_id, "name": "不明"}
-
-                name = info.get("name", "不明")
-                self.gui.set_user_threadsafe(student_id, name)
-
-                with self.store.log_lock:
-                    sessions = self.store.log_data.setdefault(student_id, [])
-
-                    if not sessions or "exit" in sessions[-1]:
-                        sessions.append({"entry": now_str})
-                        entry = True
-                    else:
-                        sessions[-1]["exit"] = now_str
-                        try:
-                            dt_entry = dt.datetime.strptime(sessions[-1]["entry"], "%Y-%m-%d %H:%M:%S")
-                            dt_exit = dt.datetime.strptime(sessions[-1]["exit"], "%Y-%m-%d %H:%M:%S")
-                            hours = round((dt_exit - dt_entry).total_seconds() / 3600.0, 2)
-                        except Exception:
-                            hours = 0.0
-                        entry = False
-
-                if entry:
-                    self.gui.status_in_threadsafe()
-                    self.sound.play("entry")
-                    self.gui.log_threadsafe(f"{now_str} ▶ 入室 - {name}")
-                    self.notifier.post(f"{now_str} {name}さんが入室しました :tada:")
-                else:
-                    self.gui.status_out_threadsafe(hours)
-                    self.sound.play("exit")
-                    self.gui.log_threadsafe(f"{now_str} ◀ 退室 - {name}")
-                    self.notifier.post(f"{now_str} {name}さんが退出しました :wave:")
-
-                self.store.save_log()
-
-        except Exception as e:
-            self.gui.log_threadsafe(f"CardWatcher 致命的エラー: {e}")
+        self.gui.log_threadsafe("CardWatcher スレッド終了")
 
 
 # =========================
