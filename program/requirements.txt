@@ -1,0 +1,4 @@
+nfcpy
+requests
+python-dotenv
+pyinstaller
