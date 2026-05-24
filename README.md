@@ -73,7 +73,7 @@ pip install -r requirements.txt
 
 ### 5. ビルドする
 `build.bat` ファイルを実行します。<br>
-出来なければ、仮想環境を有効化した状態でコマンドプロンプトから実行してください。
+実行出来なければ、仮想環境を有効化した状態でコマンドプロンプトから実行してください。
 
 ```bat
 venv311\Scripts\activate
@@ -86,8 +86,8 @@ pyinstaller card_reader.spec --noconfirm
 dist\
 └── card_reader\
     ├── card_reader.exe
-    ├── Entry用.wav     ← 別途用意してください
-    ├── Exit用.wav      ← 別途用意してください
+    ├── Entry用.wav     ← 別途用意してください（任意）
+    ├── Exit用.wav      ← 別途用意してください（任意）
     └── _internal\
         ├── .env
         └── ...
@@ -103,7 +103,7 @@ dist\
     - 音声ファイル(.wav)を格納する場合は、 `card_reader.py` の指定の箇所に記載があるか
 3. `dist\card_reader\` 内にある `card_reader.exe` を実行
 4. 以下の画面が表示されているか確認
-    <img src="./起動画面.png">
+    <img src="./起動画面.jpg">
     - 表示されていなければ、よくあるエラーを参考にしてください。
 
 ## 実行時に自動生成されるファイル
