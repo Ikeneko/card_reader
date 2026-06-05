@@ -10,6 +10,7 @@ import threading
 import datetime as dt
 import subprocess
 from threading import Event, Lock
+from concurrent.futures import ThreadPoolExecutor
 
 import tkinter as tk
 from tkinter import messagebox
@@ -52,6 +53,9 @@ class Config:
 
         # カード種類に関係なく、前回処理からの最小間隔
         self.read_interval_guard_seconds: float = float(os.environ.get("READ_INTERVAL_GUARD_SECONDS", "1.0"))
+
+        # NFC リーダーの定期再接続間隔（秒）。デフォルト1時間
+        self.clf_reconnect_interval: float = float(os.environ.get("CLF_RECONNECT_INTERVAL", "3600"))
 
 
 CFG = Config()
@@ -101,12 +105,9 @@ def iter_fiscal_weeks(
     """指定範囲内の週を列挙する。
     ルール:
       - 通常は日曜始まり・土曜終わり
-      - 3/31 23:59:59 で必ず劇切り（曜日に関わらず）
+      - 3/31 23:59:59 で必ず区切り（曜日に関わらず）
       - 4/1 00:00:00 から新しい週開始
     """
-    MARCH_END_MD = (3, 31)  # 年度末：3/31
-    APRIL_START_MD = (4, 1)  # 年度始：4/1
-
     weeks: list[tuple[dt.datetime, dt.datetime]] = []
     cur = range_start
 
@@ -123,12 +124,10 @@ def iter_fiscal_weeks(
 
         # cur が 4/1 より前で 3/31 が通常の週末より前にある場合：境界で分割
         if cur < april_start and march_end < normal_end:
-            # この週は 3/31 で打ち切り
             week_end = min(normal_end, march_end)
         else:
             week_end = normal_end
 
-        # week_end は本来の週末（3/31または土曜）そのものを返す（range_end で切り捨てない）
         weeks.append((cur, week_end))
 
         # 次週の開始を決める
@@ -163,7 +162,26 @@ class Store:
             cfg.weekly_sent_file, {}
         )  # {student_id: {"YYYY-MM-DD": hours}}
 
+        # ログの遅延書き込み用フラグ
+        self._log_dirty: bool = False
+        self._dirty_lock: Lock = Lock()
+
     def save_log(self) -> None:
+        # 即座に書き込まず、フラグを立てるだけにする
+        with self._dirty_lock:
+            self._log_dirty = True
+
+    def flush_log_if_dirty(self) -> None:
+        # WeeklySender の定期ループから呼び出してまとめて書き込む
+        with self._dirty_lock:
+            if not self._log_dirty:
+                return
+            self._log_dirty = False
+        with self.log_lock:
+            dump_json(self.cfg.log_file, self.log_data)
+
+    def save_log_immediate(self) -> None:
+        # DailyCloser など即時書き込みが必要な箇所から呼ぶ
         with self.log_lock:
             dump_json(self.cfg.log_file, self.log_data)
 
@@ -181,12 +199,14 @@ class Notifier:
     def __init__(self, cfg: Config, gui: "GUIApp | None" = None):
         self.cfg = cfg
         self.gui = gui
+        # スレッドを毎回生成せず、最大2本のスレッドプールで管理する
+        # → Slack が遅延してもスレッドが無限に蓄積しない
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="slack_notify")
 
     def post(self, text: str) -> None:
         if not self.cfg.slack_token:
             return
-        # 別スレッドで送信して即リターン（カード読み取りをブロックしない）
-        threading.Thread(target=self._send, args=(text,), daemon=True).start()
+        self._executor.submit(self._send, text)
 
     def _send(self, text: str) -> None:
         try:
@@ -197,6 +217,10 @@ class Notifier:
         except Exception as e:
             if self.gui:
                 self.gui.log_threadsafe(f"Slack通知失敗: {e}")
+
+    def shutdown(self) -> None:
+        # アプリ終了時にプールを安全に停止する
+        self._executor.shutdown(wait=False)
 
 
 # =========================
@@ -406,7 +430,14 @@ class GUIApp:
                 result_q.put(e)
 
         self.root.after(0, _show)
-        result = result_q.get()
+
+        # timeout を設定してフリーズを防ぐ
+        # 60秒以内に操作がなければ登録をスキップする
+        try:
+            result = result_q.get(timeout=60)
+        except queue.Empty:
+            self.log_threadsafe(f"[警告] 新規登録ダイアログがタイムアウトしました（student_id={student_id}）")
+            return None
 
         if isinstance(result, Exception):
             raise result
@@ -471,6 +502,7 @@ class DailyCloser(threading.Thread):
                     changed = True
 
             if changed:
+                # DailyCloser は即時書き込みが必要なので専用メソッドを使う
                 dump_json(self.store.cfg.log_file, self.store.log_data)
 
         if closed:
@@ -580,8 +612,6 @@ class WeeklySender(threading.Thread):
 
         # 週の開始を日曜始まりに合わせる
         earliest_week_start, _ = sunday_range(earliest)
-        # iter_fiscal_weeks には十分先の上限を渡す（切り捨てない）
-        # 送信スキップの判定は下記 week_end + 1秒 > now_dt で行う
         far_future = now_dt + dt.timedelta(days=365)
 
         payload: dict[str, list[dict]] = {}
@@ -589,7 +619,7 @@ class WeeklySender(threading.Thread):
         for week_start, week_end in iter_fiscal_weeks(earliest_week_start, far_future):
             # 週がまだ終わっていない（送信タイミングが未到達）ならスキップ
             if week_end + dt.timedelta(seconds=1) > now_dt:
-                break  # 以降の週もまだ終わっていないので break
+                break
 
             week_key = week_start.strftime("%Y-%m-%d")
 
@@ -619,10 +649,12 @@ class WeeklySender(threading.Thread):
             now = dt.datetime.now()
 
             # 終了済みの未送信週をまとめて送信する
-            # build_pending が「週が終わっているか」「未送信か」を判断する
             pending = self.build_pending_weeks_payload(now)
             if pending:
                 self.post_weekly_payload(pending)
+
+            # 30秒ごとにログの遅延書き込みを実行する
+            self.store.flush_log_if_dirty()
 
             self.stop.wait(30)
 
@@ -644,121 +676,142 @@ class CardWatcher(threading.Thread):
         self.gui.log_threadsafe("FeliCa 学籍番号読取モードで待機中")
 
         # 重複読み取りガード用の状態
-        # 同一カードIDが duplicate_guard_seconds 以内に再度来たらスキップ
         last_student_id: str | None = None
         last_processed_at: float = 0.0
 
         service_code = self.cfg.service_code
 
         # --- リトライループ ---
-        # USB切断・ハードウェアエラーが発生してもスレッドが死なずに自動復旧する。
         while not self.stop.is_set():
             clf: nfc.ContactlessFrontend | None = None
             try:
                 clf = nfc.ContactlessFrontend('usb')
                 self.gui.log_threadsafe("NFC リーダー接続完了")
 
+                # clf の起動時刻を記録し、一定時間経過後に定期再接続する
+                clf_started_at = time.monotonic()
+
                 # --- カード読み取りループ ---
                 while not self.stop.is_set():
-                    detected: dict[str, str | None] = {"student_id": None}
 
-                    def connected(tag, _detected=detected):
-                        # クロージャの意図を明示するためデフォルト引数で detected を束縛する
-                        if isinstance(tag, nfc.tag.tt3.Type3Tag):
-                            try:
-                                svcd = nfc.tag.tt3.ServiceCode(service_code >> 6, service_code & 0x3f)
-                                blcd = nfc.tag.tt3.BlockCode(0, service=0)
-                                block_data = tag.read_without_encryption([svcd], [blcd])
-                                _detected["student_id"] = str(block_data[1:8].decode("utf-8"))
-                            except Exception as e:
-                                self.gui.log_threadsafe(f"カード読み取りエラー: {e}")
-                        else:
+                    def connected(tag):
+                        # =========================================================
+                        # カードが置かれた瞬間にここへ来る。
+                        # 全処理をここで完結させ、カードを離すまで return しない。
+                        # =========================================================
+
+                        # ※ nonlocal は関数の先頭で宣言する必要がある
+                        nonlocal last_student_id, last_processed_at
+
+                        # --- 学籍番号読み取り ---
+                        if not isinstance(tag, nfc.tag.tt3.Type3Tag):
                             self.gui.log_threadsafe("エラー: FeliCa (Type3Tag) 以外のカードです")
+                            return True  # カードが離れるまで待つ
+
+                        try:
+                            svcd = nfc.tag.tt3.ServiceCode(service_code >> 6, service_code & 0x3f)
+                            blcd = nfc.tag.tt3.BlockCode(0, service=0)
+                            block_data = tag.read_without_encryption([svcd], [blcd])
+                            student_id = str(block_data[1:8].decode("utf-8"))
+                        except Exception as e:
+                            self.gui.log_threadsafe(f"カード読み取りエラー: {e}")
+                            return True
+
+                        now_ts = time.monotonic()
+
+                        # --- 重複読み取りガード ---
+                        if (student_id == last_student_id
+                                and (now_ts - last_processed_at) < self.cfg.duplicate_guard_seconds):
+                            return True
+
+                        # ガードを通過したら状態を更新
+                        last_student_id = student_id
+                        last_processed_at = now_ts
+
+                        now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                        # --- 未登録なら登録ダイアログ → 氏名確定 ---
+                        with self.store.student_map_lock:
+                            info = self.store.student_map.get(student_id)
+                        if not info:
+                            self.gui.set_user_threadsafe(student_id, "不明")
+                            reg = self.gui.prompt_registration_threadsafe(student_id)
+                            if reg:
+                                with self.store.student_map_lock:
+                                    self.store.student_map[student_id] = {
+                                        "student_id": student_id,
+                                        "name": reg["name"],
+                                    }
+                                self.store.save_student_map()
+                                self.gui.log_threadsafe(f"新規登録: {student_id} / {reg['name']}")
+                                with self.store.student_map_lock:
+                                    info = self.store.student_map[student_id]
+                            else:
+                                self.gui.log_threadsafe("登録をキャンセルしました")
+                                info = {"student_id": student_id, "name": "不明"}
+
+                        # --- 学籍番号・氏名をGUIに表示 ---
+                        name = info.get("name", "不明")
+                        self.gui.set_user_threadsafe(student_id, name)
+
+                        # --- 入退室判定・ログ保存 ---
+                        with self.store.log_lock:
+                            sessions = self.store.log_data.setdefault(student_id, [])
+                            if not sessions or "exit" in sessions[-1]:
+                                sessions.append({"entry": now_str})
+                                entry = True
+                            else:
+                                sessions[-1]["exit"] = now_str
+                                try:
+                                    dt_entry = dt.datetime.strptime(sessions[-1]["entry"], "%Y-%m-%d %H:%M:%S")
+                                    dt_exit = dt.datetime.strptime(sessions[-1]["exit"], "%Y-%m-%d %H:%M:%S")
+                                    hours = round((dt_exit - dt_entry).total_seconds() / 3600.0, 2)
+                                except Exception:
+                                    hours = 0.0
+                                entry = False
+
+                        # フラグを立てるだけ（実際の書き込みは WeeklySender の30秒ループで行う）
+                        self.store.save_log()
+
+                        # --- 「入室しました」or「退室しました」表示・効果音・Slack通知 ---
+                        if entry:
+                            self.gui.status_in_threadsafe()
+                            self.sound.play("entry")
+                            self.gui.log_threadsafe(f"{now_str} ▶ 入室 - {name}")
+                            self.notifier.post(f"{now_str} {name}さんが入室しました :tada:")
+                        else:
+                            self.gui.status_out_threadsafe(hours)
+                            self.sound.play("exit")
+                            self.gui.log_threadsafe(f"{now_str} ◀ 退室 - {name}")
+                            self.notifier.post(f"{now_str} {name}さんが退出しました :wave:")
+
                         # True を返すとカードが離れるまで on-connect を1回だけ呼ぶ
                         return True
 
-                    clf.connect(rdwr={"on-connect": connected})
-                    # ↑ ここでカードが検出されるまでブロック。
-                    #   sleep不要 — clf.connect が次のカードまで待ってくれる。
+                    # terminate コールバックを渡す
+                    # → stop_evt がセットされると clf.connect() が自動的に抜ける
+                    # → 定期再接続タイミングでも抜けられる
+                    def terminate_fn():
+                        if self.stop.is_set():
+                            return True
+                        if time.monotonic() - clf_started_at >= self.cfg.clf_reconnect_interval:
+                            return True
+                        return False
 
-                    student_id = detected["student_id"]
-                    if not student_id:
-                        # Type3Tag以外など読み取り失敗。即座に次のループへ。
-                        continue
+                    clf.connect(rdwr={"on-connect": connected}, terminate=terminate_fn)
+                    # ↑ カードが検出されるまでここでブロック。後続処理なし。
 
-                    now_ts = time.monotonic()
-
-                    # --- 重複読み取りガード ---
-                    # 同一カードが duplicate_guard_seconds 以内に来たら無視する。
-                    # 異なるカードは間隔に関わらず即処理する。
-                    if (student_id == last_student_id
-                            and (now_ts - last_processed_at) < self.cfg.duplicate_guard_seconds):
-                        continue
-
-                    last_student_id = student_id
-                    last_processed_at = now_ts
-                    # -------------------------
-
-                    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                    with self.store.student_map_lock:
-                        info = self.store.student_map.get(student_id)
-                    if not info:
-                        self.gui.set_user_threadsafe(student_id, "不明")
-                        reg = self.gui.prompt_registration_threadsafe(student_id)
-                        if reg:
-                            with self.store.student_map_lock:
-                                self.store.student_map[student_id] = {
-                                    "student_id": student_id,
-                                    "name": reg["name"],
-                                }
-                            self.store.save_student_map()
-                            self.gui.log_threadsafe(f"新規登録: {student_id} / {reg['name']}")
-                            with self.store.student_map_lock:
-                                info = self.store.student_map[student_id]
-                        else:
-                            self.gui.log_threadsafe("登録をキャンセルしました")
-                            info = {"student_id": student_id, "name": "不明"}
-
-                    name = info.get("name", "不明")
-                    self.gui.set_user_threadsafe(student_id, name)
-
-                    with self.store.log_lock:
-                        sessions = self.store.log_data.setdefault(student_id, [])
-
-                        if not sessions or "exit" in sessions[-1]:
-                            sessions.append({"entry": now_str})
-                            entry = True
-                        else:
-                            sessions[-1]["exit"] = now_str
-                            try:
-                                dt_entry = dt.datetime.strptime(sessions[-1]["entry"], "%Y-%m-%d %H:%M:%S")
-                                dt_exit = dt.datetime.strptime(sessions[-1]["exit"], "%Y-%m-%d %H:%M:%S")
-                                hours = round((dt_exit - dt_entry).total_seconds() / 3600.0, 2)
-                            except Exception:
-                                hours = 0.0
-                            entry = False
-
-                    if entry:
-                        self.gui.status_in_threadsafe()
-                        self.sound.play("entry")
-                        self.gui.log_threadsafe(f"{now_str} ▶ 入室 - {name}")
-                        self.notifier.post(f"{now_str} {name}さんが入室しました :tada:")
-                    else:
-                        self.gui.status_out_threadsafe(hours)
-                        self.sound.play("exit")
-                        self.gui.log_threadsafe(f"{now_str} ◀ 退室 - {name}")
-                        self.notifier.post(f"{now_str} {name}さんが退出しました :wave:")
-
-                    self.store.save_log()
+                    # 定期再接続チェック：設定秒数を超えたら clf を再起動する
+                    if time.monotonic() - clf_started_at >= self.cfg.clf_reconnect_interval:
+                        self.gui.log_threadsafe(
+                            f"[定期再接続] {self.cfg.clf_reconnect_interval / 3600:.1f}時間経過 → リーダーを再起動します"
+                        )
+                        break  # 外側ループへ → finally で clf.close() → 再接続
 
             except Exception as e:
-                # USB切断・ハードウェア障害など予期せぬエラー。
-                # GUIに警告を表示し、5秒後に clf を再初期化してリトライする。
                 self.gui.log_threadsafe(f"[警告] CardWatcher エラー（5秒後に再接続します）: {e}")
                 self.gui.show_reader_error_threadsafe()
             finally:
-                # clf が開いていれば必ずクローズしてリソースを解放する
                 if clf is not None:
                     try:
                         clf.close()
@@ -792,6 +845,9 @@ def main():
     watcher.start()
 
     gui.run(stop_evt)
+
+    # GUIが閉じられたらSlackスレッドプールを終了する
+    notifier.shutdown()
 
 
 if __name__ == "__main__":
