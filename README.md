@@ -47,7 +47,7 @@ WEEKLY_POST_URL=http://IPアドレス:ポート番号/card_entry
 ---
 
 ### 3. FeliCa リーダーのドライバを WinUSB に切り替える
-nfcpy は WinUSB ドライバを必要とします。
+nfcpy は WinUSB ドライバを必要とします。<br>
 [Zadig](https://zadig.akeo.ie/) を使って以下の手順で切り替えてください。
 
 1. Zadig を起動する
@@ -100,7 +100,7 @@ dist\
 2. ビルドができているか確認する
     - `.env` にSlackトークン、チャンネルID、送信先IPアドレスが記載されているか
     - `dist\card_reader\` に音声ファイル(.wav)が格納されているか（任意）
-    - 音声ファイル(.wav)を格納する場合は、 `card_reader.py` の指定の箇所に記載があるか
+    - 音声ファイル(.wav)を格納する場合は、`dist\card_reader\_internal\.env` の `ENTRY_SOUND` / `EXIT_SOUND` にファイルパスが記載されているか
 3. `dist\card_reader\` 内にある `card_reader.exe` を実行
 4. 以下の画面が表示されているか確認
     <img src="./起動画面.jpg">
