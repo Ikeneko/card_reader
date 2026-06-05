@@ -112,7 +112,6 @@ dist\
 | `student_map.json` | 学籍番号 → 氏名の対応表 |
 | `entry_log.json` | 入退室の全履歴 |
 | `weekly_sent.json` | 週次集計の送信済み記録 |
-| `weekly_last_run.txt` | 最後に集計を実行した日時 |
 
 これらは `.gitignore` に含まれており、Git で管理されません。<br>
 実行時に `dist\card_reader\` 内に自動生成されます。

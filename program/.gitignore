@@ -3,7 +3,6 @@
 student_map.json
 entry_log.json
 weekly_sent.json
-weekly_last_run.txt
 
 # Sound files (not redistributable)
 *.wav
