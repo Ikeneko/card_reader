@@ -786,6 +786,7 @@ class CardWatcher(threading.Thread):
                             self.notifier.post(f"{now_str} {name}さんが退出しました :wave:")
 
                         # True を返すとカードが離れるまで on-connect を1回だけ呼ぶ
+                        # ↑ 上記の処理が終わってからカードを離すと clf.connect() が返る
                         return True
 
                     # terminate コールバックを渡す
